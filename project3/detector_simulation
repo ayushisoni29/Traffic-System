@@ -1,0 +1,213 @@
+import pygame, random, os
+from collections import deque
+import threading
+import time
+import cv2
+import numpy as np
+
+# ---------------- Vehicle Detector ----------------
+class VehicleDetector:
+    def __init__(self):
+        self.SCREEN_W, self.SCREEN_H = 1200, 720
+        self.ROAD_WIDTH = 220
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.SCREEN_W)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.SCREEN_H)
+        self.background = None
+        self.threshold = 30
+        self.min_area = 500
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+        center_x = self.SCREEN_W // 2
+        center_y = self.SCREEN_H // 2
+        self.detection_zones = {
+            'NORTH': (center_x - 100, center_y - self.ROAD_WIDTH, 200, 200),
+            'SOUTH': (center_x - 100, center_y + self.ROAD_WIDTH - 200, 200, 200),
+            'EAST':  (center_x + self.ROAD_WIDTH - 200, center_y - 100, 200, 200),
+            'WEST':  (center_x - self.ROAD_WIDTH, center_y - 100, 200, 200)
+        }
+        self.vehicle_counts = {d:0 for d in ['NORTH','SOUTH','EAST','WEST']}
+        self.lock = threading.Lock()
+
+    def detect_vehicles_frame(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5,5), 0)
+        if self.background is None:
+            self.background = gray.copy()
+            return []
+
+        diff = cv2.absdiff(self.background, gray)
+        _, thresh = cv2.threshold(diff, self.threshold, 255, cv2.THRESH_BINARY)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, self.kernel)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, self.kernel)
+
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        vehicles_per_zone = {d:0 for d in self.detection_zones}
+
+        for cnt in contours:
+            if cv2.contourArea(cnt) < self.min_area:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            for zone_name, (zx, zy, zw, zh) in self.detection_zones.items():
+                if zx < x < zx+zw and zy < y < zy+zh:
+                    vehicles_per_zone[zone_name] += 1
+
+        cv2.accumulateWeighted(gray, self.background, 0.02)
+        return vehicles_per_zone, thresh
+
+    def run(self):
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+            counts, thresh = self.detect_vehicles_frame(frame)
+            with self.lock:
+                self.vehicle_counts = counts.copy()
+            # Optional: Show detection frame
+            cv2.imshow("Detection", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+# ---------------- Traffic Simulation ----------------
+SCREEN_W, SCREEN_H = 1200, 720
+FPS = 60
+GREEN_TIME = 6.0
+YELLOW_TIME = 2.0
+ROAD_WIDTH = 220
+LANE_WIDTH = ROAD_WIDTH // 2
+
+pygame.init()
+screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+pygame.display.set_caption("Smart City – One Signal at a Time")
+clock = pygame.time.Clock()
+font = pygame.font.SysFont(None, 22)
+
+def load_image(filename, size=None):
+    path = os.path.join(os.path.dirname(__file__), filename)
+    img = pygame.image.load(path).convert_alpha()
+    if size:
+        img = pygame.transform.scale(img, size)
+    return img
+
+BACKGROUND = load_image("city.jpg", (SCREEN_W, SCREEN_H))
+RED = (255,0,0)
+YELLOW = (255,255,0)
+GREEN = (0,255,0)
+DARK = (50,50,50)
+NORTH, SOUTH, EAST, WEST = "N","S","E","W"
+DIRECTIONS = [NORTH,SOUTH,EAST,WEST]
+
+LIGHT_POS = {
+    NORTH: (SCREEN_W//2-30, SCREEN_H//2-ROAD_WIDTH//2-70),
+    SOUTH: (SCREEN_W//2-30, SCREEN_H//2+ROAD_WIDTH//2),
+    EAST:  (SCREEN_W//2+ROAD_WIDTH//2-20, SCREEN_H//2-20),
+    WEST:  (SCREEN_W//2-ROAD_WIDTH//2-20, SCREEN_H//2-20),
+}
+
+VEHICLE_TYPES = {
+    "car": {"image": load_image("car1.png",(50,100)), "length":50, "width":100},
+    "bus": {"image": load_image("bus2.png",(60,140)), "length":60, "width":140},
+    "truck": {"image": load_image("truc.png",(70,150)), "length":70, "width":150},
+    "ambulance": {"image": load_image("ambulance1.png",(50,110)), "length":50,"width":110}
+}
+
+class TrafficLight:
+    def __init__(self,x,y,direction):
+        self.x,self.y,self.direction=x,y,direction
+        self.state="red"
+        self.light_radius=6
+    def draw(self,surf):
+        color_map={"red":RED,"yellow":YELLOW,"green":GREEN,"dark":DARK}
+        pygame.draw.circle(surf,color_map[self.state],(self.x,self.y),self.light_radius)
+
+class Vehicle:
+    def __init__(self,kind,direction):
+        self.kind=kind
+        self.image=VEHICLE_TYPES[kind]["image"]
+        self.dir=direction
+        self.speed=3
+        self.in_intersection=False
+        if self.dir==NORTH: self.image=pygame.transform.rotate(self.image,180)
+        elif self.dir==EAST: self.image=pygame.transform.rotate(self.image,90)
+        elif self.dir==WEST: self.image=pygame.transform.rotate(self.image,-90)
+        if direction==NORTH: self.x,self.y=SCREEN_W//2-40,0-120
+        elif direction==SOUTH:self.x,self.y=SCREEN_W//2+20,SCREEN_H+50
+        elif direction==EAST:self.x,self.y=SCREEN_W+60,SCREEN_H//2-40
+        elif direction==WEST:self.x,self.y=-120,SCREEN_H//2+20
+        self.rect=self.image.get_rect(center=(self.x,self.y))
+    def move(self,green_dir,vehicles):
+        stop_points={NORTH:SCREEN_H//2-ROAD_WIDTH//2-20,
+                     SOUTH:SCREEN_H//2+ROAD_WIDTH//2+20,
+                     EAST: SCREEN_W//2+ROAD_WIDTH//2+20,
+                     WEST: SCREEN_W//2-ROAD_WIDTH//2-20}
+        if self.dir==NORTH and self.y+ self.rect.height>=stop_points[NORTH] and self.dir!=green_dir:return
+        if self.dir==SOUTH and self.y<=stop_points[SOUTH] and self.dir!=green_dir:return
+        if self.dir==EAST and self.x<=stop_points[EAST] and self.dir!=green_dir:return
+        if self.dir==WEST and self.x+self.rect.width>=stop_points[WEST] and self.dir!=green_dir:return
+        if self.dir==NORTH:self.y+=self.speed
+        elif self.dir==SOUTH:self.y-=self.speed
+        elif self.dir==EAST:self.x-=self.speed
+        elif self.dir==WEST:self.x+=self.speed
+        self.rect.center=(self.x,self.y)
+    def draw(self,surf): surf.blit(self.image,self.rect)
+
+class TrafficSystem:
+    def __init__(self,detector):
+        self.queues={d:deque() for d in DIRECTIONS}
+        self.green_dir=NORTH
+        self.phase_timer=GREEN_TIME
+        self.detector=detector
+        self.traffic_lights={d:TrafficLight(*LIGHT_POS[d],d) for d in DIRECTIONS}
+        self.traffic_lights[self.green_dir].state="green"
+    def update(self,dt):
+        # Auto-select green based on detected vehicles
+        with self.detector.lock:
+            counts=self.detector.vehicle_counts.copy()
+        max_lane=max(counts,key=lambda k: counts[k])
+        self.green_dir=max_lane
+        for d,light in self.traffic_lights.items():
+            light.state="green" if d==self.green_dir else "red"
+        # Move vehicles
+        all_vehicles=[]
+        for d in DIRECTIONS: all_vehicles.extend(self.queues[d])
+        for d in DIRECTIONS:
+            for v in self.queues[d]: v.move(self.green_dir,all_vehicles)
+        # Remove off-screen
+        for d in DIRECTIONS:
+            self.queues[d]=deque([v for v in self.queues[d] if -200<v.x<SCREEN_W+200 and -200<v.y<SCREEN_H+200])
+    def spawn_vehicle(self,direction):
+        kind=random.choice(list(VEHICLE_TYPES.keys()))
+        v=Vehicle(kind,direction)
+        self.queues[direction].appendleft(v)
+    def draw(self,surf):
+        surf.blit(BACKGROUND,(0,0))
+        for d,light in self.traffic_lights.items(): light.draw(surf)
+        for d in DIRECTIONS:
+            for v in self.queues[d]: v.draw(surf)
+        txt=f"Green Lane: {self.green_dir}"
+        surf.blit(font.render(txt,True,(0,0,0)),(20,20))
+
+# ---------------- Main Loop ----------------
+def main():
+    detector=VehicleDetector()
+    threading.Thread(target=detector.run,daemon=True).start()
+    system=TrafficSystem(detector)
+    spawn_timer=0
+    running=True
+    while running:
+        dt=clock.tick(FPS)/1000
+        for event in pygame.event.get():
+            if event.type==pygame.QUIT: running=False
+        spawn_timer+=dt
+        if spawn_timer>2.5:
+            system.spawn_vehicle(random.choice(DIRECTIONS))
+            spawn_timer=0
+        system.update(dt)
+        system.draw(screen)
+        pygame.display.flip()
+    pygame.quit()
+
+if __name__=="__main__":
+    main()
